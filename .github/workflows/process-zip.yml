@@ -35,7 +35,9 @@ jobs:
 
       - name: Copy extracted files
         run: |
-          cp -r extracted/. ./
+          NAME=$(basename "$ZIP_FILE" .zip)
+          mkdir -p "output/$NAME"
+          cp -r extracted/. "output/$NAME/"
 
       - name: Remove processed ZIP
         run: |
@@ -55,4 +57,5 @@ jobs:
           fi
 
           git commit -m "Automatically extract uploaded ZIP"
+          git pull --rebase
           git push
