@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: process-zip
+  cancel-in-progress: false
+
 jobs:
   process-zip:
     runs-on: ubuntu-latest
@@ -16,46 +20,187 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find uploaded ZIP
+      - name: Process all ZIP files safely
+        shell: bash
         run: |
-          ZIP_FILE=$(find _inbox -maxdepth 1 -type f -name "*.zip" | head -n 1)
+          set -euo pipefail
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found."
-            exit 1
+          mkdir -p _failed
+          shopt -s nullglob
+          zips=( _inbox/*.zip )
+
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No ZIP files found."
+            exit 0
           fi
 
-          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
-          echo "Found: $ZIP_FILE"
+          python3 - <<'PY'
+          import re
+          import shutil
+          import stat
+          import zipfile
+          from pathlib import Path
 
-      - name: Extract ZIP
-        run: |
-          mkdir -p extracted
-          unzip -o "$ZIP_FILE" -d extracted
+          # Safety limits
+          MAX_ZIP_BYTES = 50 * 1024 * 1024
+          MAX_FILES = 1000
+          MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 
-      - name: Copy extracted files
-        run: |
-          NAME=$(basename "$ZIP_FILE" .zip)
-          mkdir -p "output/$NAME"
-          cp -r extracted/. "output/$NAME/"
+          # Allowed ZIP filename characters
+          NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-      - name: Remove processed ZIP
-        run: |
-          rm -f "$ZIP_FILE"
-          rm -rf extracted
+          inbox = Path("_inbox")
+          failed = Path("_failed")
 
-      - name: Commit extracted files
+          failed.mkdir(exist_ok=True)
+
+          zips = sorted(inbox.glob("*.zip"))
+
+          for zip_path in zips:
+              name = zip_path.stem
+
+              print(f"\n=== Processing {zip_path} ===")
+
+              try:
+                  # 1. Check ZIP file size
+                  zip_size = zip_path.stat().st_size
+
+                  if zip_size > MAX_ZIP_BYTES:
+                      raise ValueError("ZIP exceeds the 50 MB limit")
+
+                  # 2. Validate ZIP filename
+                  if not NAME_RE.fullmatch(name):
+                      raise ValueError(
+                          "ZIP filename contains unsupported characters"
+                      )
+
+                  # 3. Open and validate ZIP
+                  with zipfile.ZipFile(zip_path) as zf:
+
+                      infos = zf.infolist()
+
+                      if len(infos) > MAX_FILES:
+                          raise ValueError(
+                              f"ZIP contains more than {MAX_FILES} entries"
+                          )
+
+                      total_size = 0
+
+                      for info in infos:
+
+                          # Normalize Windows-style paths
+                          raw = info.filename.replace("\\", "/")
+
+                          # Path traversal protection
+                          if (
+                              raw.startswith("/")
+                              or raw.startswith("../")
+                              or "/../" in raw
+                              or raw == ".."
+                          ):
+                              raise ValueError(
+                                  f"Unsafe path in ZIP: {info.filename}"
+                              )
+
+                          parts = Path(raw).parts
+
+                          if ".." in parts:
+                              raise ValueError(
+                                  f"Unsafe path in ZIP: {info.filename}"
+                              )
+
+                          # Symlink protection
+                          mode = (info.external_attr >> 16) & 0xFFFF
+
+                          if stat.S_ISLNK(mode):
+                              raise ValueError(
+                                  f"Symlink entries are not allowed: "
+                                  f"{info.filename}"
+                              )
+
+                          # Uncompressed-size protection
+                          total_size += info.file_size
+
+                          if total_size > MAX_UNCOMPRESSED_BYTES:
+                              raise ValueError(
+                                  "ZIP uncompressed content exceeds "
+                                  "the 100 MB limit"
+                              )
+
+                      # 4. Destination
+                      destination = Path("output") / name
+
+                      destination.mkdir(parents=True, exist_ok=True)
+
+                      # 5. Safe extraction
+                      for info in infos:
+
+                          raw = info.filename.replace("\\", "/")
+
+                          target = destination / raw
+
+                          resolved = target.resolve()
+                          root = destination.resolve()
+
+                          # Make sure extraction stays inside destination
+                          if (
+                              resolved != root
+                              and root not in resolved.parents
+                          ):
+                              raise ValueError(
+                                  f"Extraction would leave destination: "
+                                  f"{info.filename}"
+                              )
+
+                          if info.is_dir():
+                              target.mkdir(parents=True, exist_ok=True)
+                          else:
+                              target.parent.mkdir(
+                                  parents=True,
+                                  exist_ok=True
+                              )
+
+                              with zf.open(info) as source:
+                                  with open(target, "wb") as output_file:
+                                      shutil.copyfileobj(source, output_file)
+
+                  # 6. Successful processing
+                  zip_path.unlink()
+
+                  print(f"SUCCESS: imported to output/{name}/")
+
+              except Exception as exc:
+
+                  # 7. Failed processing
+                  print(f"FAILED: {exc}")
+
+                  failed_target = failed / zip_path.name
+
+                  if failed_target.exists():
+                      failed_target.unlink()
+
+                  shutil.move(str(zip_path), str(failed_target))
+
+          print("\nZIP processing complete.")
+          PY
+
+      - name: Commit results
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add .
+          git add -A
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Automatically extract uploaded ZIP"
+          git commit -m "Process ZIP inbox"
+
           git pull --rebase
+
           git push
